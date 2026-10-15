@@ -7,6 +7,8 @@
 #include "DataMap.h"
 #include "DatabaseEnv.h"
 #include "WorldSession.h"
+#include <mutex>
+#include <unordered_map>
 
 using namespace Acore::ChatCommands;
 
@@ -62,15 +64,31 @@ public:
     bool Changed = false;
 };
 
+// Rates changed since startup, by character. Async writes on several database workers
+// are not ordered against a later login's read, so the login load checks this first.
+// A rate <= 0 means "use DefaultXPRate" (the row was deleted).
+std::unordered_map<uint32, float> ChangedRates;
+std::mutex ChangedRatesLock;
+
 // Stores a rate the player chose. The write is async and only happens when
-// the rate actually changes, never on login or logout.
-void SetPlayerXpRate(Player* player, float rate)
+// the rate actually changes, never on login or logout. useDefault deletes the
+// row, so the character follows DefaultXPRate from then on.
+void SetPlayerXpRate(Player* player, float rate, bool useDefault = false)
 {
     PlayerXpRate* data = player->CustomData.GetDefault<PlayerXpRate>("IndividualXP");
     data->XPRate = rate;
     data->Changed = true;
 
-    CharacterDatabase.Execute("REPLACE INTO `individualxp` (`CharacterGUID`, `XPRate`) VALUES ('{}', '{}')", player->GetGUID().GetCounter(), rate);
+    uint32 const guid = player->GetGUID().GetCounter();
+    {
+        std::lock_guard<std::mutex> lock(ChangedRatesLock);
+        ChangedRates[guid] = useDefault ? 0.0f : rate;
+    }
+
+    if (useDefault)
+        CharacterDatabase.Execute("DELETE FROM `individualxp` WHERE `CharacterGUID`='{}'", guid);
+    else
+        CharacterDatabase.Execute("REPLACE INTO `individualxp` (`CharacterGUID`, `XPRate`) VALUES ('{}', '{}')", guid, rate);
 }
 
 void AnnounceRates(Player* player)
@@ -117,8 +135,14 @@ public:
                     return;
 
                 PlayerXpRate* data = player->CustomData.GetDefault<PlayerXpRate>("IndividualXP");
-                if (result && !data->Changed)
-                    data->XPRate = result->Fetch()[0].Get<float>();
+                if (!data->Changed)
+                {
+                    std::lock_guard<std::mutex> lock(ChangedRatesLock);
+                    if (auto itr = ChangedRates.find(guid.GetCounter()); itr != ChangedRates.end())
+                        data->XPRate = itr->second > 0.0f ? itr->second : individualXp.DefaultRate;
+                    else if (result)
+                        data->XPRate = result->Fetch()[0].Get<float>();
+                }
 
                 if (announce)
                     AnnounceRates(player);
@@ -310,7 +334,7 @@ public:
         }
         else
         {
-            SetPlayerXpRate(player, individualXp.DefaultRate);
+            SetPlayerXpRate(player, individualXp.DefaultRate, true);
             ChatHandler(handler->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_DEFAULT, individualXp.DefaultRate);
             return true;
         }
