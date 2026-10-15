@@ -5,6 +5,10 @@
 #include "Player.h"
 #include "Object.h"
 #include "DataMap.h"
+#include "DatabaseEnv.h"
+#include "WorldSession.h"
+#include <mutex>
+#include <unordered_map>
 
 using namespace Acore::ChatCommands;
 
@@ -56,7 +60,52 @@ public:
     PlayerXpRate() {}
     PlayerXpRate(float XPRate) : XPRate(XPRate) {}
     float XPRate = 1.0f;
+    // Set once the player changes the rate, so a late login load does not overwrite it.
+    bool Changed = false;
 };
+
+// Rates changed since startup, by character. Async writes on several database workers
+// are not ordered against a later login's read, so the login load checks this first.
+// A rate <= 0 means "use DefaultXPRate" (the row was deleted).
+std::unordered_map<uint32, float> ChangedRates;
+std::mutex ChangedRatesLock;
+
+// Stores a rate the player chose. The write is async and only happens when
+// the rate actually changes, never on login or logout. useDefault deletes the
+// row, so the character follows DefaultXPRate from then on.
+void SetPlayerXpRate(Player* player, float rate, bool useDefault = false)
+{
+    PlayerXpRate* data = player->CustomData.GetDefault<PlayerXpRate>("IndividualXP");
+    data->XPRate = rate;
+    data->Changed = true;
+
+    uint32 const guid = player->GetGUID().GetCounter();
+    {
+        std::lock_guard<std::mutex> lock(ChangedRatesLock);
+        ChangedRates[guid] = useDefault ? 0.0f : rate;
+    }
+
+    if (useDefault)
+        CharacterDatabase.Execute("DELETE FROM `individualxp` WHERE `CharacterGUID`='{}'", guid);
+    else
+        CharacterDatabase.Execute("REPLACE INTO `individualxp` (`CharacterGUID`, `XPRate`) VALUES ('{}', '{}')", guid, rate);
+}
+
+void AnnounceRates(Player* player)
+{
+    if (!individualXp.Enabled || !individualXp.AnnounceRatesOnLogin)
+        return;
+
+    if (player->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN))
+    {
+        ChatHandler(player->GetSession()).PSendSysMessage(ACORE_STRING_RATES_DISABLED);
+    }
+    else
+    {
+        ChatHandler(player->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_VIEW, player->CustomData.GetDefault<PlayerXpRate>("IndividualXP")->XPRate);
+        ChatHandler(player->GetSession()).PSendSysMessage(ACORE_STRING_MAX_RATE, individualXp.MaxRate);
+    }
+}
 
 class IndividualXP : public PlayerScript
 {
@@ -65,48 +114,39 @@ public:
 
     void OnPlayerLogin(Player* player) override
     {
-        QueryResult result = CharacterDatabase.Query("SELECT `XPRate` FROM `individualxp` WHERE `CharacterGUID`='{}'", player->GetGUID().GetCounter());
+        // Use the default rate until the stored one has loaded.
+        player->CustomData.GetDefault<PlayerXpRate>("IndividualXP")->XPRate = individualXp.DefaultRate;
 
-        if (!result)
+        WorldSession* session = player->GetSession();
+        bool const announce = !session->IsHeadless(); // bots get no chat lines
+
+        if (announce && individualXp.Enabled && individualXp.AnnounceModule)
         {
-            player->CustomData.GetDefault<PlayerXpRate>("IndividualXP")->XPRate = individualXp.DefaultRate;
-        }
-        else
-        {
-            Field* fields = result->Fetch();
-            player->CustomData.Set("IndividualXP", new PlayerXpRate(fields[0].Get<float>()));
+            ChatHandler(session).SendSysMessage(ACORE_STRING_CREDIT);
         }
 
-        if (individualXp.Enabled)
-        {
-            // Announce Module
-            if (individualXp.AnnounceModule)
+        ObjectGuid const guid = player->GetGUID();
+        session->GetQueryProcessor().AddCallback(CharacterDatabase.AsyncQuery(Acore::StringFormat(
+            "SELECT `XPRate` FROM `individualxp` WHERE `CharacterGUID`='{}'", guid.GetCounter()))
+            .WithCallback([session, guid, announce](QueryResult result)
             {
-                ChatHandler(player->GetSession()).SendSysMessage(ACORE_STRING_CREDIT);
-            }
+                Player* player = session->GetPlayer();
+                if (!player || player->GetGUID() != guid)
+                    return;
 
-            // Announce Rates
-            if (individualXp.AnnounceRatesOnLogin)
-            {
-                if (player->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN))
+                PlayerXpRate* data = player->CustomData.GetDefault<PlayerXpRate>("IndividualXP");
+                if (!data->Changed)
                 {
-                    ChatHandler(player->GetSession()).PSendSysMessage(ACORE_STRING_RATES_DISABLED);
+                    std::lock_guard<std::mutex> lock(ChangedRatesLock);
+                    if (auto itr = ChangedRates.find(guid.GetCounter()); itr != ChangedRates.end())
+                        data->XPRate = itr->second > 0.0f ? itr->second : individualXp.DefaultRate;
+                    else if (result)
+                        data->XPRate = result->Fetch()[0].Get<float>();
                 }
-                else
-                {
-                    ChatHandler(player->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_VIEW, player->CustomData.GetDefault<PlayerXpRate>("IndividualXP")->XPRate);
-                    ChatHandler(player->GetSession()).PSendSysMessage(ACORE_STRING_MAX_RATE, individualXp.MaxRate);
-                }
-            }
-        }
-    }
 
-    void OnPlayerLogout(Player* player) override
-    {
-        if (PlayerXpRate* data = player->CustomData.Get<PlayerXpRate>("IndividualXP"))
-        {
-            CharacterDatabase.DirectExecute("REPLACE INTO `individualxp` (`CharacterGUID`, `XPRate`) VALUES ('{}', '{}');", player->GetGUID().GetCounter(), data->XPRate);
-        }
+                if (announce)
+                    AnnounceRates(player);
+            }));
     }
 
     void OnPlayerGiveXP(Player* player, uint32& amount, Unit* /*victim*/, uint8 /*xpSource*/) override
@@ -211,7 +251,7 @@ public:
                 return false;
             }
 
-            player->CustomData.GetDefault<PlayerXpRate>("IndividualXP")->XPRate = rate;
+            SetPlayerXpRate(player, rate);
             ChatHandler(handler->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_SET, rate);
             return true;
         }
@@ -294,7 +334,7 @@ public:
         }
         else
         {
-            player->CustomData.GetDefault<PlayerXpRate>("IndividualXP")->XPRate = individualXp.DefaultRate;
+            SetPlayerXpRate(player, individualXp.DefaultRate, true);
             ChatHandler(handler->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_DEFAULT, individualXp.DefaultRate);
             return true;
         }
