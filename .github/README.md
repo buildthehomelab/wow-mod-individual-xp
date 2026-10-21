@@ -45,7 +45,7 @@ Rates at or below `RampStartRate` apply in full at every level. `.xp view` says 
 
 # Addon
 
-DragonUI's XP & Rep Bars settings and its XP bar's right-click menu set the rate through this module. They talk to it with addon whispers to the player under the prefix `DUI_XPRATE` (`HELLO`, `SET:<rate>`, `DEFAULT`, `ON`, `OFF`; the module answers `R:<rate>:<max>:<min>:<rampStart>:<rampFullLevel>:<off>`). Any addon can use the same messages.
+DragonUI's XP & Rep Bars settings and its XP bar's right-click menu set the rate through this module. They talk to it with addon whispers to the player under the prefix `DUI_XPRATE` (`HELLO`, `SET:<rate>`, `DEFAULT`, `ON`, `OFF`; the module answers `R:<rate>:<max>:<min>:<rampStart>:<rampFullLevel>:<off>`). A change that comes within 100 ms of the previous one is not made, only answered with `R`, to keep scripts from flooding the character database; a client should space its messages. Any addon can use the same messages.
 
 # Player Commands
 

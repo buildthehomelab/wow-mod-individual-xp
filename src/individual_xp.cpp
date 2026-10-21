@@ -8,7 +8,10 @@
 #include "DatabaseEnv.h"
 #include "WorldSession.h"
 #include "StringConvert.h"
+#include "Log.h"
+#include "Timer.h"
 #include "WorldPacket.h"
+#include <algorithm>
 #include <cmath>
 #include <mutex>
 #include <unordered_map>
@@ -62,8 +65,19 @@ public:
         individualXp.AnnounceRatesOnLogin = sConfigMgr->GetOption<bool>("IndividualXp.AnnounceRatesOnLogin", true);
         individualXp.MaxRate = sConfigMgr->GetOption<float>("IndividualXp.MaxXPRate", 10.0f);
         individualXp.DefaultRate = sConfigMgr->GetOption<float>("IndividualXp.DefaultXPRate", 1.0f);
+
+        // A start rate near 0 would round level 1's XP down to nothing and leave the character stuck there.
         individualXp.RampStartRate = sConfigMgr->GetOption<float>("IndividualXp.RampStartRate", 1.0f);
-        individualXp.RampFullLevel = sConfigMgr->GetOption<uint32>("IndividualXp.RampFullLevel", 30);
+        if (!(individualXp.RampStartRate >= MIN_RATE))
+        {
+            LOG_WARN("module", "IndividualXp.RampStartRate {} is below {}, using {}.", individualXp.RampStartRate, MIN_RATE, MIN_RATE);
+            individualXp.RampStartRate = MIN_RATE;
+        }
+
+        int32 const rampFullLevel = sConfigMgr->GetOption<int32>("IndividualXp.RampFullLevel", 30);
+        individualXp.RampFullLevel = uint32(std::clamp<int32>(rampFullLevel, 0, STRONG_MAX_LEVEL));
+        if (int32(individualXp.RampFullLevel) != rampFullLevel)
+            LOG_WARN("module", "IndividualXp.RampFullLevel {} is out of range, using {}.", rampFullLevel, individualXp.RampFullLevel);
     }
 };
 
@@ -75,6 +89,11 @@ public:
     float XPRate = 1.0f;
     // Set once the player changes the rate, so a late login load does not overwrite it.
     bool Changed = false;
+    // True when the character follows DefaultXPRate (no stored row). Unknown (false) until the
+    // login load or a change, so an early DEFAULT from the addon still deletes the row.
+    bool FollowsDefault = false;
+    // getMSTime() of the last addon request, to throttle them (see OnPlayerCanUseChat).
+    uint32 LastAddonRequest = 0;
 };
 
 // Rates changed since startup, by character. Async writes on several database workers
@@ -91,6 +110,7 @@ void SetPlayerXpRate(Player* player, float rate, bool useDefault = false)
     PlayerXpRate* data = player->CustomData.GetDefault<PlayerXpRate>("IndividualXP");
     data->XPRate = rate;
     data->Changed = true;
+    data->FollowsDefault = useDefault;
 
     uint32 const guid = player->GetGUID().GetCounter();
     {
@@ -154,6 +174,7 @@ void SendRampLine(ChatHandler* handler, Player* player, float rate)
 //                      DEFAULT        follow DefaultXPRate again, like .xp default
 //                      ON / OFF       like .xp enable / .xp disable
 constexpr char const* ADDON_PREFIX = "DUI_XPRATE";
+constexpr uint32 ADDON_REQUEST_COOLDOWN = 100; // ms
 
 void SendStateToAddon(Player* player)
 {
@@ -218,9 +239,18 @@ public:
                 {
                     std::lock_guard<std::mutex> lock(ChangedRatesLock);
                     if (auto itr = ChangedRates.find(guid.GetCounter()); itr != ChangedRates.end())
+                    {
                         data->XPRate = itr->second > 0.0f ? itr->second : individualXp.DefaultRate;
+                        data->FollowsDefault = itr->second <= 0.0f;
+                    }
                     else if (result)
-                        data->XPRate = result->Fetch()[0].Get<float>();
+                    {
+                        // A row from before MaxXPRate was lowered still keeps to today's limits.
+                        data->XPRate = std::clamp(result->Fetch()[0].Get<float>(), MIN_RATE, std::max(MIN_RATE, individualXp.MaxRate));
+                        data->FollowsDefault = false;
+                    }
+                    else
+                        data->FollowsDefault = true;
                 }
 
                 if (announce)
@@ -243,6 +273,10 @@ public:
     }
 
     // The addon whispers itself. Every whisper with our prefix is answered here and swallowed.
+    // The core lets through 100 addon messages a second, too many for database writes, so a
+    // change that comes within ADDON_REQUEST_COOLDOWN of the last one is not made. It is still
+    // answered, so the client shows the rate that holds. DragonUI spaces its own messages
+    // further apart than that, but server lag can bunch them up.
     bool OnPlayerCanUseChat(Player* player, uint32 /*type*/, uint32 lang, std::string& msg, Player* receiver) override
     {
         if (lang != LANG_ADDON || receiver != player)
@@ -258,13 +292,23 @@ public:
         std::string_view const request = std::string_view(msg).substr(prefixTab.size());
         bool const xpOff = player->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN);
 
+        PlayerXpRate* data = player->CustomData.GetDefault<PlayerXpRate>("IndividualXP");
+        uint32 const now = getMSTime();
+        if (request != "HELLO" && data->LastAddonRequest && getMSTimeDiff(data->LastAddonRequest, now) < ADDON_REQUEST_COOLDOWN)
+        {
+            SendStateToAddon(player);
+            return false;
+        }
+        if (request != "HELLO")
+            data->LastAddonRequest = now ? now : 1;
+
         if (request == "ON")
             player->RemoveFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN);
         else if (request == "OFF")
             player->SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN);
         else if (request == "DEFAULT")
         {
-            if (!xpOff)
+            if (!xpOff && !data->FollowsDefault) // .xp default always deletes, to repair a stray row
                 SetPlayerXpRate(player, individualXp.DefaultRate, true);
         }
         else if (request.substr(0, 4) == "SET:")
