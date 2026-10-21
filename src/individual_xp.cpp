@@ -63,7 +63,7 @@ public:
         individualXp.MaxRate = sConfigMgr->GetOption<float>("IndividualXp.MaxXPRate", 10.0f);
         individualXp.DefaultRate = sConfigMgr->GetOption<float>("IndividualXp.DefaultXPRate", 1.0f);
         individualXp.RampStartRate = sConfigMgr->GetOption<float>("IndividualXp.RampStartRate", 1.0f);
-        individualXp.RampFullLevel = sConfigMgr->GetOption<uint32>("IndividualXp.RampFullLevel", 20);
+        individualXp.RampFullLevel = sConfigMgr->GetOption<uint32>("IndividualXp.RampFullLevel", 30);
     }
 };
 

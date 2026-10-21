@@ -28,7 +28,7 @@ The variables to configure in the Config:
     - This is the max amount a player can set their xp to.
 - `IndividualXp.DefaultXPRate`
     - This is the default rate players start with.
-- `IndividualXp.RampFullLevel` (default 20) and `IndividualXp.RampStartRate` (default 1)
+- `IndividualXp.RampFullLevel` (default 30) and `IndividualXp.RampStartRate` (default 1)
     - A rate above the start rate grows with the character's level instead of applying in full from level 1. See *Level ramp* below. `RampFullLevel` 0 turns it off.
 
 The Max XP Rate variable dictates how high a player can set their XP rate. While the Default XP Rate variable dictates what XP rate players start with and the rate will be set to if the user does `.xp default`. As a recommendation, it would be a good idea to set the default and maximum experience rates to match. In this way, all players would initially have the maximum experience on the server, and then, through the `.xp set` command, they could modify it.
@@ -37,9 +37,9 @@ The Max XP Rate variable dictates how high a player can set their XP rate. While
 
 The first levels need very little XP, so a high rate turns them into one quest (or a few kills) per level. With the ramp a chosen rate climbs in a straight line from `RampStartRate` at level 1 to the full rate at `RampFullLevel`, counting the part of the current level already done, so there is never a jump. With 5x and the defaults:
 
-| Level | 1 | 5 | 10 | 15 | 20+ |
-|-------|---|---|----|----|-----|
-| Rate  | 1x | 1.8x | 2.9x | 3.9x | 5x |
+| Level | 1 | 5 | 10 | 15 | 20 | 25 | 30+ |
+|-------|---|---|----|----|----|----|-----|
+| Rate  | 1x | 1.6x | 2.2x | 2.9x | 3.6x | 4.3x | 5x |
 
 Rates at or below `RampStartRate` apply in full at every level. `.xp view` says when the rate is still growing and what it is right now.
 

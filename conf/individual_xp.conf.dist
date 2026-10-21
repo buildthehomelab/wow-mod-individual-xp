@@ -69,13 +69,13 @@ IndividualXp.DefaultXPRate = 1
 #                in a straight line with the character's level (counting the part of the current level
 #                already done) and applies in full from this level on. Without it, a high rate makes
 #                every one of the first levels take a single quest or a handful of kills.
-#                Example with 5x and 20: 1x at level 1, 2.9x at level 10, 5x from level 20.
+#                Example with 5x and 30: 1x at level 1, 2.2x at level 10, 3.6x at level 20, 5x from level 30.
 #                0 or 1 turns the ramp off: the chosen rate applies at every level.
 #
-#   Default: 20
+#   Default: 30
 #
 
-IndividualXp.RampFullLevel = 20
+IndividualXp.RampFullLevel = 30
 
 #
 #   IndividualXp.RampStartRate
