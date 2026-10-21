@@ -7,6 +7,9 @@
 #include "DataMap.h"
 #include "DatabaseEnv.h"
 #include "WorldSession.h"
+#include "StringConvert.h"
+#include "WorldPacket.h"
+#include <cmath>
 #include <mutex>
 #include <unordered_map>
 
@@ -21,6 +24,10 @@ struct IndividualXpModule
 {
     bool Enabled, AnnounceModule, AnnounceRatesOnLogin;
     float MaxRate, DefaultRate;
+    // A chosen rate above RampStartRate grows with the character's level: RampStartRate at level 1,
+    // the full rate from RampFullLevel on. RampFullLevel 0 or 1 turns the ramp off.
+    float RampStartRate;
+    uint32 RampFullLevel;
 };
 
 IndividualXpModule individualXp;
@@ -36,8 +43,12 @@ enum IndividualXPAcoreString
     ACORE_STRING_COMMAND_SET,
     ACORE_STRING_COMMAND_DISABLED,
     ACORE_STRING_COMMAND_ENABLED,
-    ACORE_STRING_COMMAND_DEFAULT
+    ACORE_STRING_COMMAND_DEFAULT,
+    ACORE_STRING_RAMP
 };
+
+// The minimum rate .xp set accepts.
+constexpr float MIN_RATE = 0.1f;
 
 class IndividualXPConf : public WorldScript
 {
@@ -51,6 +62,8 @@ public:
         individualXp.AnnounceRatesOnLogin = sConfigMgr->GetOption<bool>("IndividualXp.AnnounceRatesOnLogin", true);
         individualXp.MaxRate = sConfigMgr->GetOption<float>("IndividualXp.MaxXPRate", 10.0f);
         individualXp.DefaultRate = sConfigMgr->GetOption<float>("IndividualXp.DefaultXPRate", 1.0f);
+        individualXp.RampStartRate = sConfigMgr->GetOption<float>("IndividualXp.RampStartRate", 1.0f);
+        individualXp.RampFullLevel = sConfigMgr->GetOption<uint32>("IndividualXp.RampFullLevel", 20);
     }
 };
 
@@ -91,6 +104,70 @@ void SetPlayerXpRate(Player* player, float rate, bool useDefault = false)
         CharacterDatabase.Execute("REPLACE INTO `individualxp` (`CharacterGUID`, `XPRate`) VALUES ('{}', '{}')", guid, rate);
 }
 
+float GetPlayerXpRate(Player* player)
+{
+    return player->CustomData.GetDefault<PlayerXpRate>("IndividualXP")->XPRate;
+}
+
+bool IsRamping(Player* player, float rate)
+{
+    return individualXp.RampFullLevel > 1 && rate > individualXp.RampStartRate
+        && player->GetLevel() < individualXp.RampFullLevel;
+}
+
+// The rate a kill or quest is paid at right now. While ramping it climbs in a straight line with
+// the character's level, counting the part of the current level already done, so it never jumps:
+// a chosen 5x is 1x at level 1, 3x halfway to RampFullLevel and 5x from RampFullLevel on.
+float GetEffectiveXpRate(Player* player, float rate)
+{
+    if (!IsRamping(player, rate))
+        return rate;
+
+    float progress = float(player->GetLevel() - 1);
+    if (uint32 const next = player->GetUInt32Value(PLAYER_NEXT_LEVEL_XP))
+        progress += std::min(1.0f, float(player->GetUInt32Value(PLAYER_XP)) / float(next));
+
+    float const start = individualXp.RampStartRate;
+    return start + (rate - start) * std::min(1.0f, progress / float(individualXp.RampFullLevel - 1));
+}
+
+// Rounded to one decimal, for chat.
+float ForChat(float rate)
+{
+    return std::round(rate * 10.0f) / 10.0f;
+}
+
+void SendRampLine(ChatHandler* handler, Player* player, float rate)
+{
+    if (IsRamping(player, rate))
+        handler->PSendSysMessage(ACORE_STRING_RAMP, individualXp.RampFullLevel, ForChat(GetEffectiveXpRate(player, rate)));
+}
+
+// DragonUI's XP rate setting (its modules/xprate.lua) talks to the module with addon whispers to
+// the player under this prefix:
+//   server -> client   R:<rate>:<max>:<min>:<rampStart>:<rampFullLevel>:<off>
+//                      the chosen rate and what the setting may offer; off is 1 while XP gain is
+//                      turned off. The client works the ramp out itself from the level and XP.
+//                      Sent after the stored rate loads at login, on HELLO and after every change.
+//   client -> server   HELLO          send R again (the UI was reloaded)
+//                      SET:<rate>     choose a rate, like .xp set
+//                      DEFAULT        follow DefaultXPRate again, like .xp default
+//                      ON / OFF       like .xp enable / .xp disable
+constexpr char const* ADDON_PREFIX = "DUI_XPRATE";
+
+void SendStateToAddon(Player* player)
+{
+    if (!individualXp.Enabled || player->GetSession()->IsHeadless())
+        return;
+
+    std::string const message = Acore::StringFormat("{}\tR:{}:{}:{}:{}:{}:{}", ADDON_PREFIX, GetPlayerXpRate(player),
+        individualXp.MaxRate, MIN_RATE, individualXp.RampStartRate, individualXp.RampFullLevel,
+        player->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN) ? 1 : 0);
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, LANG_ADDON, player, player, message);
+    player->GetSession()->SendPacket(&data);
+}
+
 void AnnounceRates(Player* player)
 {
     if (!individualXp.Enabled || !individualXp.AnnounceRatesOnLogin)
@@ -102,8 +179,10 @@ void AnnounceRates(Player* player)
     }
     else
     {
-        ChatHandler(player->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_VIEW, player->CustomData.GetDefault<PlayerXpRate>("IndividualXP")->XPRate);
-        ChatHandler(player->GetSession()).PSendSysMessage(ACORE_STRING_MAX_RATE, individualXp.MaxRate);
+        ChatHandler handler(player->GetSession());
+        handler.PSendSysMessage(ACORE_STRING_COMMAND_VIEW, GetPlayerXpRate(player));
+        SendRampLine(&handler, player, GetPlayerXpRate(player));
+        handler.PSendSysMessage(ACORE_STRING_MAX_RATE, individualXp.MaxRate);
     }
 }
 
@@ -145,7 +224,10 @@ public:
                 }
 
                 if (announce)
+                {
                     AnnounceRates(player);
+                    SendStateToAddon(player);
+                }
             }));
     }
 
@@ -155,9 +237,46 @@ public:
         {
             if (PlayerXpRate* data = player->CustomData.Get<PlayerXpRate>("IndividualXP"))
             {
-                amount = static_cast<uint32>(std::round(static_cast<float>(amount) * data->XPRate));
+                amount = static_cast<uint32>(std::round(static_cast<float>(amount) * GetEffectiveXpRate(player, data->XPRate)));
             }
         }
+    }
+
+    // The addon whispers itself. Every whisper with our prefix is answered here and swallowed.
+    bool OnPlayerCanUseChat(Player* player, uint32 /*type*/, uint32 lang, std::string& msg, Player* receiver) override
+    {
+        if (lang != LANG_ADDON || receiver != player)
+            return true;
+
+        std::string const prefixTab = std::string(ADDON_PREFIX) + "\t";
+        if (msg.compare(0, prefixTab.size(), prefixTab) != 0)
+            return true;
+
+        if (!individualXp.Enabled)
+            return false;
+
+        std::string_view const request = std::string_view(msg).substr(prefixTab.size());
+        bool const xpOff = player->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN);
+
+        if (request == "ON")
+            player->RemoveFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN);
+        else if (request == "OFF")
+            player->SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN);
+        else if (request == "DEFAULT")
+        {
+            if (!xpOff)
+                SetPlayerXpRate(player, individualXp.DefaultRate, true);
+        }
+        else if (request.substr(0, 4) == "SET:")
+        {
+            // A rate the command would turn down is ignored; the R below puts the setting back.
+            Optional<float> const rate = Acore::StringTo<float>(request.substr(4));
+            if (!xpOff && rate && *rate >= MIN_RATE && *rate <= individualXp.MaxRate && *rate != GetPlayerXpRate(player))
+                SetPlayerXpRate(player, *rate);
+        }
+
+        SendStateToAddon(player);
+        return false;
     }
 };
 
@@ -207,7 +326,8 @@ public:
         }
         else
         {
-            ChatHandler(handler->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_VIEW, player->CustomData.GetDefault<PlayerXpRate>("IndividualXP")->XPRate);
+            handler->PSendSysMessage(ACORE_STRING_COMMAND_VIEW, GetPlayerXpRate(player));
+            SendRampLine(handler, player, GetPlayerXpRate(player));
         }
         return true;
     }
@@ -244,7 +364,7 @@ public:
                 return false;
             }
 
-            if (rate < 0.1f)
+            if (rate < MIN_RATE)
             {
                 handler->PSendSysMessage(ACORE_STRING_MIN_RATE);
                 handler->SetSentErrorMessage(true);
@@ -253,6 +373,8 @@ public:
 
             SetPlayerXpRate(player, rate);
             ChatHandler(handler->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_SET, rate);
+            SendRampLine(handler, player, rate);
+            SendStateToAddon(player);
             return true;
         }
     }
@@ -276,6 +398,7 @@ public:
             // Turn Disabled On But Don't Change Value...
             player->SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN);
             ChatHandler(handler->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_DISABLED);
+            SendStateToAddon(player);
             return true;
         }
         else
@@ -303,6 +426,7 @@ public:
         {
             player->RemoveFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN);
             ChatHandler(handler->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_ENABLED);
+            SendStateToAddon(player);
         }
         else
         {
@@ -336,6 +460,8 @@ public:
         {
             SetPlayerXpRate(player, individualXp.DefaultRate, true);
             ChatHandler(handler->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_DEFAULT, individualXp.DefaultRate);
+            SendRampLine(handler, player, individualXp.DefaultRate);
+            SendStateToAddon(player);
             return true;
         }
     }
