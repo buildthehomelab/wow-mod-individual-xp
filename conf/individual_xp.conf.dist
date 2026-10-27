@@ -42,7 +42,9 @@ IndividualXp.AnnounceRatesOnLogin = true
 #
 #   IndividualXp.MaxXPRate
 #
-#   Description: This is the max amount a player can set their xp to.
+#   Description: This is the max amount a player can set their xp to. A challenge from
+#                mod-challenges can lower it for its characters (Hardcore: 1); their chosen
+#                rate comes back once the challenge ends.
 #   Example: 1 or 2 or 3 or 4 (Any positive integer you want)
 #
 #   Default: 10

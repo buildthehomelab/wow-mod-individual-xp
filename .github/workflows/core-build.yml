@@ -9,4 +9,4 @@ jobs:
   build:
     uses: azerothcore/reusable-workflows/.github/workflows/core_build_modules.yml@main
     with:
-      module_repo: ${{ github.event.repository.name }}
+      module_repo: mod-individual-xp   # the module folder is mod-individual-xp; the repo name carries a wow- prefix
