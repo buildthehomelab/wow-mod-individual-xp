@@ -134,7 +134,7 @@ float GetPlayerXpRate(Player* player)
 
 // The highest rate the player may have: MaxXPRate, or less while a challenge caps experience
 // (mod-challenges' Hardcore: 1x).
-float GetMaxXpRate(Player* player)
+float GetMaxXpRate([[maybe_unused]] Player* player)
 {
     float max = individualXp.MaxRate;
 #if __has_include("ChallengesApi.h")
