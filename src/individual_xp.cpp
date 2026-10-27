@@ -11,6 +11,9 @@
 #include "Log.h"
 #include "Timer.h"
 #include "WorldPacket.h"
+#if __has_include("ChallengesApi.h")
+#include "ChallengesApi.h"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <mutex>
@@ -129,6 +132,25 @@ float GetPlayerXpRate(Player* player)
     return player->CustomData.GetDefault<PlayerXpRate>("IndividualXP")->XPRate;
 }
 
+// The highest rate the player may have: MaxXPRate, or less while a challenge caps experience
+// (mod-challenges' Hardcore: 1x).
+float GetMaxXpRate(Player* player)
+{
+    float max = individualXp.MaxRate;
+#if __has_include("ChallengesApi.h")
+    if (float const cap = Challenges::XpRateCap(player->GetGUID().GetCounter()))
+        max = std::min(max, std::max(MIN_RATE, cap));
+#endif
+    return max;
+}
+
+// The rate that holds: the chosen one, held to today's maximum. The stored choice stays as it is,
+// so it comes back once the cap lifts.
+float GetHeldXpRate(Player* player)
+{
+    return std::min(GetPlayerXpRate(player), GetMaxXpRate(player));
+}
+
 bool IsRamping(Player* player, float rate)
 {
     return individualXp.RampFullLevel > 1 && rate > individualXp.RampStartRate
@@ -181,8 +203,8 @@ void SendStateToAddon(Player* player)
     if (!individualXp.Enabled || player->GetSession()->IsHeadless())
         return;
 
-    std::string const message = Acore::StringFormat("{}\tR:{}:{}:{}:{}:{}:{}", ADDON_PREFIX, GetPlayerXpRate(player),
-        individualXp.MaxRate, MIN_RATE, individualXp.RampStartRate, individualXp.RampFullLevel,
+    std::string const message = Acore::StringFormat("{}\tR:{}:{}:{}:{}:{}:{}", ADDON_PREFIX, GetHeldXpRate(player),
+        GetMaxXpRate(player), MIN_RATE, individualXp.RampStartRate, individualXp.RampFullLevel,
         player->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_NO_XP_GAIN) ? 1 : 0);
     WorldPacket data;
     ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, LANG_ADDON, player, player, message);
@@ -201,9 +223,9 @@ void AnnounceRates(Player* player)
     else
     {
         ChatHandler handler(player->GetSession());
-        handler.PSendSysMessage(ACORE_STRING_COMMAND_VIEW, GetPlayerXpRate(player));
-        SendRampLine(&handler, player, GetPlayerXpRate(player));
-        handler.PSendSysMessage(ACORE_STRING_MAX_RATE, individualXp.MaxRate);
+        handler.PSendSysMessage(ACORE_STRING_COMMAND_VIEW, GetHeldXpRate(player));
+        SendRampLine(&handler, player, GetHeldXpRate(player));
+        handler.PSendSysMessage(ACORE_STRING_MAX_RATE, GetMaxXpRate(player));
     }
 }
 
@@ -267,7 +289,8 @@ public:
         {
             if (PlayerXpRate* data = player->CustomData.Get<PlayerXpRate>("IndividualXP"))
             {
-                amount = static_cast<uint32>(std::round(static_cast<float>(amount) * GetEffectiveXpRate(player, data->XPRate)));
+                amount = static_cast<uint32>(std::round(static_cast<float>(amount) * GetEffectiveXpRate(player,
+                    std::min(data->XPRate, GetMaxXpRate(player)))));
             }
         }
     }
@@ -315,7 +338,7 @@ public:
         {
             // A rate the command would turn down is ignored; the R below puts the setting back.
             Optional<float> const rate = Acore::StringTo<float>(request.substr(4));
-            if (!xpOff && rate && *rate >= MIN_RATE && *rate <= individualXp.MaxRate && *rate != GetPlayerXpRate(player))
+            if (!xpOff && rate && *rate >= MIN_RATE && *rate <= GetMaxXpRate(player) && *rate != GetPlayerXpRate(player))
                 SetPlayerXpRate(player, *rate);
         }
 
@@ -370,8 +393,8 @@ public:
         }
         else
         {
-            handler->PSendSysMessage(ACORE_STRING_COMMAND_VIEW, GetPlayerXpRate(player));
-            SendRampLine(handler, player, GetPlayerXpRate(player));
+            handler->PSendSysMessage(ACORE_STRING_COMMAND_VIEW, GetHeldXpRate(player));
+            SendRampLine(handler, player, GetHeldXpRate(player));
         }
         return true;
     }
@@ -401,9 +424,9 @@ public:
         }
         else
         {
-            if (rate > individualXp.MaxRate)
+            if (rate > GetMaxXpRate(player))
             {
-                handler->PSendSysMessage(ACORE_STRING_MAX_RATE, individualXp.MaxRate);
+                handler->PSendSysMessage(ACORE_STRING_MAX_RATE, GetMaxXpRate(player));
                 handler->SetSentErrorMessage(true);
                 return false;
             }
@@ -503,8 +526,9 @@ public:
         else
         {
             SetPlayerXpRate(player, individualXp.DefaultRate, true);
-            ChatHandler(handler->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_DEFAULT, individualXp.DefaultRate);
-            SendRampLine(handler, player, individualXp.DefaultRate);
+            float const held = GetHeldXpRate(player);
+            ChatHandler(handler->GetSession()).PSendSysMessage(ACORE_STRING_COMMAND_DEFAULT, held);
+            SendRampLine(handler, player, held);
             SendStateToAddon(player);
             return true;
         }
